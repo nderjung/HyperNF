@@ -1,0 +1,45 @@
+From 5bff0cd3015a604443f4684acedc34f504775d01 Mon Sep 17 00:00:00 2001
+From: Alexander Jung <a.jung@lancs.ac.uk>
+Date: Fri, 16 Nov 2018 11:22:12 +0000
+Subject: [PATCH] i40e: Reflect i40e_detect_recover_hung_queue logic
+
+---
+ LINUX/i40e_netmap_linux.h    | 2 --
+ sys/dev/netmap/netmap_kern.h | 1 -
+ 2 files changed, 3 deletions(-)
+
+diff --git a/LINUX/i40e_netmap_linux.h b/LINUX/i40e_netmap_linux.h
+index 3c792df..c847d93 100644
+--- a/LINUX/i40e_netmap_linux.h
++++ b/LINUX/i40e_netmap_linux.h
+@@ -181,7 +181,6 @@ static int xennet_map_i40e(struct netmap_adapter *hwna)
+ 
+ 	if (netmap_xen_ops && netmap_xen_ops->map_i40e_ring) {
+ 		for (i = 0; i < hwna->num_tx_rings; i++) {
+-			unsigned long *hung_detected = &vsi->q_vectors[i]->hung_detected;
+ 			txr = NM_I40E_TX_RING(vsi, i);
+ 			rxr = NM_I40E_RX_RING(vsi, i);
+ 			D("%d/%d: try map i40e ring base_queue: %d , queue_index: %d",
+@@ -195,7 +194,6 @@ static int xennet_map_i40e(struct netmap_adapter *hwna)
+ 							    &vsi->base_queue,
+ 							    &txr->queue_index,
+ 							    &vsi->base_vector,
+-							    (u32 *) hung_detected,
+ 							    (u32 *) &vsi->state,
+ 							    (u64 *) &pf->flags);
+ 			if (ret < 0) {
+diff --git a/sys/dev/netmap/netmap_kern.h b/sys/dev/netmap/netmap_kern.h
+index e001b59..94f3bc9 100644
+--- a/sys/dev/netmap/netmap_kern.h
++++ b/sys/dev/netmap/netmap_kern.h
+@@ -2313,7 +2313,6 @@ typedef int (*map_i40e_ring_fn_t)(struct netmap_adapter *na, int rid, void *tx_r
+ 				    void *tx_rc, void *rx_rc,
+ 				    u16 *base_queue_ptr, u16 *queue_index_ptr,
+ 				    u32 *base_vector_ptr,
+-				    u32 *hung_detected,
+ 				    u32 *state,
+ 				    u64 *flags);
+ typedef void (*unmap_i40e_fn_t)(struct netmap_adapter *na);
+-- 
+2.7.4
+
