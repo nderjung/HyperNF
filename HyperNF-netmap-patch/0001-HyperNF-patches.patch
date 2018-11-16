@@ -1,24 +1,25 @@
-From 884d614a09489754f6831845331438f38958f2a5 Mon Sep 17 00:00:00 2001
-From: Kenichi Yasukata <kenichi.yasukata@neclab.eu>
-Date: Wed, 9 Aug 2017 10:08:49 +0100
+From 83aadbb4ace4ae39eb0d146a07c53f06ecbcc5d3 Mon Sep 17 00:00:00 2001
+From: Alexander Jung <a.jung@lancs.ac.uk>
+Date: Fri, 16 Nov 2018 03:25:26 +0000
 Subject: [PATCH] HyperNF patches
 
 ---
- LINUX/bsd_glue.h             |  39 +++-----
- LINUX/i40e_netmap_linux.h    | 156 +++++++++++++++++++++++++++++++-
- LINUX/netmap_linux.c         |  28 +++++-
- LINUX/xennet_lock.h          | 186 ++++++++++++++++++++++++++++++++++++++
- sys/dev/netmap/netmap.c      |   1 -
- sys/dev/netmap/netmap_kern.h | 210 +++++++++++++++++++++++++++++++++++++------
- sys/dev/netmap/netmap_mem2.c | 205 +++++++++++++++++++++++++++++++++++++++++-
- sys/dev/netmap/netmap_mem2.h |   3 +
- sys/dev/netmap/netmap_vale.c | 126 +++++---------------------
+ LINUX/bsd_glue.h             |  38 ++---
+ LINUX/i40e_netmap_linux.h    | 154 +++++++++++++++++
+ LINUX/netmap.mak.in          |   1 -
+ LINUX/netmap_linux.c         |  29 +++-
+ LINUX/xennet_lock.h          | 186 +++++++++++++++++++++
+ sys/dev/netmap/netmap.c      |   1 +
+ sys/dev/netmap/netmap_kern.h | 209 ++++++++++++++++++++---
+ sys/dev/netmap/netmap_mem2.c | 388 ++++++++++++++++++++++++++++++++++++++-----
+ sys/dev/netmap/netmap_mem2.h |   4 +
+ sys/dev/netmap/netmap_vale.c |  91 ++--------
  sys/net/netmap.h             |   3 +-
- 10 files changed, 792 insertions(+), 165 deletions(-)
+ 11 files changed, 936 insertions(+), 168 deletions(-)
  create mode 100644 LINUX/xennet_lock.h
 
 diff --git a/LINUX/bsd_glue.h b/LINUX/bsd_glue.h
-index 909eb13..ac2c710 100644
+index 5716182..bcae558 100644
 --- a/LINUX/bsd_glue.h
 +++ b/LINUX/bsd_glue.h
 @@ -64,6 +64,8 @@
@@ -27,10 +28,10 @@ index 909eb13..ac2c710 100644
  
 +#include "xennet_lock.h"
 +
- #ifndef NETMAP_LINUX_HAVE_HRTIMER_MODE_REL
- #define HRTIMER_MODE_REL	HRTIMER_REL
- #endif
-@@ -166,8 +168,8 @@ struct thread;
+ #ifndef dma_rmb
+ #define dma_rmb() rmb()
+ #endif /* dma_rmb */
+@@ -219,8 +221,8 @@ struct thread;
  #define bzero(a, len)		memset(a, 0, len)
  
  /* Atomic variables. */
@@ -41,7 +42,7 @@ index 909eb13..ac2c710 100644
  
  #define NM_ATOMIC_SET(p, v)             atomic_set(p, v)
  #define NM_ATOMIC_INC(p)                atomic_inc(p)
-@@ -261,23 +263,8 @@ int linux_netmap_set_channels(struct net_device *, struct ethtool_channels *);
+@@ -322,23 +324,8 @@ int linux_netmap_set_channels(struct net_device *, struct ethtool_channels *);
   * We use spin_lock_irqsave() because we use the lock in the
   * (hard) interrupt context.
   */
@@ -57,16 +58,16 @@ index 909eb13..ac2c710 100644
 -
 -static inline void mtx_unlock(safe_spinlock_t *m)
 -{
--	ulong flags = ACCESS_ONCE(m->flags);
+-	ulong flags = *(volatile ulong *)&m->flags;
 -        spin_unlock_irqrestore(&(m->sl), flags);
 -}
  
 -#define mtx_init(a, b, c, d)	spin_lock_init(&((a)->sl))
 +#define mtx_init(a, b, c, d)	memset(&((a)->sl), 0, sizeof(rwticket))
- #define mtx_destroy(a)		// XXX spin_lock_destroy(a)
+ #define mtx_destroy(a)
  
  #define mtx_lock_spin(a)	mtx_lock(a)
-@@ -288,17 +275,17 @@ static inline void mtx_unlock(safe_spinlock_t *m)
+@@ -349,16 +336,17 @@ static inline void mtx_unlock(safe_spinlock_t *m)
   * Must change to proper rwlock, and then can move the definitions
   * into the main netmap.c file.
   */
@@ -87,16 +88,15 @@ index 909eb13..ac2c710 100644
 +#define BDG_RTRYLOCK(b)		bdg_rdtrylock(&(b)->bdg_lock)
  #define BDG_SET_VAR(lval, p)	((lval) = (p))
  #define BDG_GET_VAR(lval)	(lval)
--#define BDG_FREE(p)		kfree(p)
 +#define BDG_FREE(p)		xfree(p)
  
- /*
-  * in the malloc/free code we ignore the type
+ #ifndef ilog2 /* not in 2.6.18 */
+ static inline int ilog2(uint64_t n)
 diff --git a/LINUX/i40e_netmap_linux.h b/LINUX/i40e_netmap_linux.h
-index d275de9..94b695a 100644
+index 226d690..3c792df 100644
 --- a/LINUX/i40e_netmap_linux.h
 +++ b/LINUX/i40e_netmap_linux.h
-@@ -78,6 +78,155 @@ SYSCTL_INT(_dev_netmap, OID_AUTO, ix_rx_miss,
+@@ -83,6 +83,155 @@ SYSCTL_INT(_dev_netmap, OID_AUTO, ix_rx_miss,
  SYSCTL_INT(_dev_netmap, OID_AUTO, ix_rx_miss_bufs,
      CTLFLAG_RW, &ix_rx_miss_bufs, 0, "potentially missed rx intr bufs");
  
@@ -252,13 +252,15 @@ index d275de9..94b695a 100644
  #if 0
  static void
  set_crcstrip(struct ixgbe_hw *hw, int onoff)
-@@ -193,11 +342,16 @@ i40e_netmap_reg(struct netmap_adapter *na, int onoff)
+@@ -216,6 +365,7 @@ i40e_netmap_reg(struct netmap_adapter *na, int onoff)
+ 	//set_crcstrip(&adapter->hw, onoff);
+ 	/* enable or disable flags and callbacks in na and ifp */
  	if (onoff) {
++		xennet_unmap_i40e(na);
  		nm_set_native_flags(na);
  	} else {
-+		xennet_unmap_i40e(na);
  		nm_clear_native_flags(na);
- 	}
+@@ -223,6 +373,10 @@ i40e_netmap_reg(struct netmap_adapter *na, int onoff)
  	if (was_running) {
  		i40e_up(vsi);
  	}
@@ -268,21 +270,24 @@ index d275de9..94b695a 100644
 +
  	//set_crcstrip(&adapter->hw, onoff); // XXX why twice ?
  
- 	clear_bit(__I40E_CONFIG_BUSY, &pf->state);
-@@ -424,7 +578,7 @@ i40e_netmap_rxsync(struct netmap_kring *kring, int flags)
+ 	clear_bit(__I40E_CONFIG_BUSY, NM_I40E_STATE(pf));
+diff --git a/LINUX/netmap.mak.in b/LINUX/netmap.mak.in
+index ce71bc9..5eafe6e 100644
+--- a/LINUX/netmap.mak.in
++++ b/LINUX/netmap.mak.in
+@@ -20,7 +20,6 @@ EXTRA_CFLAGS += -Wno-unused-but-set-variable
+ EXTRA_CFLAGS += $(foreach s,$(SUBSYS),-DCONFIG_NETMAP_$(shell echo $s|tr a-z- A-Z_))
+ EXTRA_CFLAGS += $(if $(DEBUG),-g)
  
- 	if (!netif_running(ifp))
- 		return 0;
--       
-+
- 	rxr = NM_I40E_RX_RING(vsi, kring->ring_id);
- 	if (!rxr)
- 		return ENXIO;
+-
+ # We use KSRC for the kernel configuration and sources.
+ # If the sources are elsewhere, then use SRC to point to them.
+ KSRC = @KSRC@
 diff --git a/LINUX/netmap_linux.c b/LINUX/netmap_linux.c
-index 96a8d01..a9b647c 100644
+index 6dd4153..2c0aa4f 100644
 --- a/LINUX/netmap_linux.c
 +++ b/LINUX/netmap_linux.c
-@@ -969,6 +969,11 @@ linux_netmap_mmap(struct file *f, struct vm_area_struct *vma)
+@@ -1092,6 +1092,11 @@ linux_netmap_mmap(struct file *f, struct vm_area_struct *vma)
  		vma->vm_private_data = priv;
  		vma->vm_ops = &linux_netmap_mmap_ops;
  	}
@@ -294,7 +299,7 @@ index 96a8d01..a9b647c 100644
  	return 0;
  }
  
-@@ -1050,8 +1055,14 @@ static int
+@@ -1189,8 +1194,14 @@ static int
  linux_netmap_release(struct inode *inode, struct file *file)
  {
  	(void)inode;	/* UNUSED */
@@ -310,9 +315,9 @@ index 96a8d01..a9b647c 100644
  	return (0);
  }
  
-@@ -2661,6 +2672,21 @@ EXPORT_SYMBOL(netmap_disable_all_rings);
- EXPORT_SYMBOL(netmap_enable_all_rings);
- EXPORT_SYMBOL(netmap_krings_create);
+@@ -2398,6 +2409,22 @@ EXPORT_SYMBOL(netmap_pipe_rxsync);	/* used by veth module */
+ #endif /* WITH_PIPES */
+ EXPORT_SYMBOL(netmap_verbose);
  
 +EXPORT_SYMBOL(ifunit_ref);
 +EXPORT_SYMBOL(if_rele);
@@ -329,12 +334,13 @@ index 96a8d01..a9b647c 100644
 +EXPORT_SYMBOL(netmap_xen_ops);
 +EXPORT_SYMBOL(netmap_mem_private_shared_new);
 +EXPORT_SYMBOL(netmap_vp_rxsync);
- 
++
  MODULE_AUTHOR("http://info.iet.unipi.it/~luigi/netmap/");
  MODULE_DESCRIPTION("The netmap packet I/O framework");
+ MODULE_LICENSE("Dual BSD/GPL"); /* the code here is all BSD. */
 diff --git a/LINUX/xennet_lock.h b/LINUX/xennet_lock.h
 new file mode 100644
-index 0000000..bab5725
+index 0000000..b07bf31
 --- /dev/null
 +++ b/LINUX/xennet_lock.h
 @@ -0,0 +1,186 @@
@@ -361,84 +367,84 @@ index 0000000..bab5725
 +
 +union rwticket
 +{
-+	u32 u;
-+	u16 us;
-+	__extension__ struct
-+	{
-+		u8 write;
-+		u8 read;
-+		u8 users;
-+		u8 margin;
-+	} s;
++    u32 u;
++    u16 us;
++    __extension__ struct
++    {
++        u8 write;
++        u8 read;
++        u8 users;
++        u8 margin;
++    } s;
 +};
 +
 +typedef struct {
 +        rwticket    sl;
-+        ulong	    flags;
++        ulong        flags;
 +} safe_spinlock_t;
 +
 +static void rwticket_wrlock(rwticket *l)
 +{
-+	u32 me = xn_atomic_xadd(&l->u, (1<<16));
-+	u8 val = me >> 16;
++    u32 me = xn_atomic_xadd(&l->u, (1<<16));
++    u8 val = me >> 16;
 +
-+	while (val != l->s.write) cpu_relax();
++    while (val != l->s.write) cpu_relax();
 +}
 +
 +static void rwticket_wrunlock(rwticket *l)
 +{
-+	rwticket t = *l;
++    rwticket t = *l;
 +
-+	barrier();
++    barrier();
 +
-+	t.s.write++;
-+	t.s.read++;
++    t.s.write++;
++    t.s.read++;
 +
-+	*(unsigned short *) l = t.us;
++    *(unsigned short *) l = t.us;
 +}
 +
 +#if defined(__xennet__) || defined(XENNET_LOCK)
 +static void rwticket_rdlock(rwticket *l)
 +{
-+	u32 me = xn_atomic_xadd(&l->u, (1<<16));
-+	u8 val = me >> 16;
++    u32 me = xn_atomic_xadd(&l->u, (1<<16));
++    u8 val = me >> 16;
 +
-+	while (val != l->s.read) cpu_relax();
-+	l->s.read++;
++    while (val != l->s.read) cpu_relax();
++    l->s.read++;
 +}
 +
 +static void rwticket_rdunlock(rwticket *l)
 +{
-+	xn_atomic_inc(&l->s.write);
++    xn_atomic_inc(&l->s.write);
 +}
 +
 +static int rwticket_rdtrylock(rwticket *l)
 +{
-+	u32 me = l->s.users;
-+	u32 write = l->s.write;
-+	u8 menew = me + 1;
-+	u32 cmp = (me << 16) + (me << 8) + write;
-+	u32 cmpnew = ((unsigned) menew << 16) + (menew << 8) + write;
-+	l->s.margin = 0; // for sure
++    u32 me = l->s.users;
++    u32 write = l->s.write;
++    u8 menew = me + 1;
++    u32 cmp = (me << 16) + (me << 8) + write;
++    u32 cmpnew = ((unsigned) menew << 16) + (menew << 8) + write;
++    l->s.margin = 0; // for sure
 +
-+	if (xn_cmpxchg(&l->u, cmp, cmpnew) == cmp) return 1;
++    if (xn_cmpxchg(&l->u, cmp, cmpnew) == cmp) return 1;
 +
-+	return 0;
++    return 0;
 +}
 +
 +static inline void bdg_rdlock(safe_spinlock_t *m)
 +{
-+	rwticket_rdlock(&(m->sl));
++    rwticket_rdlock(&(m->sl));
 +}
 +
 +static inline unsigned int bdg_rdtrylock(safe_spinlock_t *m)
 +{
-+	return rwticket_rdtrylock(&(m->sl));
++    return rwticket_rdtrylock(&(m->sl));
 +}
 +
 +static inline void bdg_rdunlock(safe_spinlock_t *m)
 +{
-+	rwticket_rdunlock(&(m->sl));
++    rwticket_rdunlock(&(m->sl));
 +}
 +
 +#endif
@@ -446,46 +452,46 @@ index 0000000..bab5725
 +/* irqsave */
 +static inline unsigned long rwticket_wrlock_irqsave(rwticket *l)
 +{
-+	unsigned long flags;
++    unsigned long flags;
 +#if !defined(__xennet__)
-+	local_irq_save(flags);
-+	preempt_disable();
++    local_irq_save(flags);
++    preempt_disable();
 +#else
-+	flags = 0;
++    flags = 0;
 +#endif
-+	rwticket_wrlock(l);
++    rwticket_wrlock(l);
 +
-+	return flags;
++    return flags;
 +}
 +
 +static inline void rwticket_wrunlock_irqrestore(rwticket *l, unsigned long flags)
 +{
-+	rwticket_wrunlock(l);
++    rwticket_wrunlock(l);
 +#if !defined(__xennet__)
-+	local_irq_restore(flags);
-+	preempt_enable();
++    local_irq_restore(flags);
++    preempt_enable();
 +#endif
 +}
 +
 +static inline void bdg_wrlock(safe_spinlock_t *m)
 +{
-+	rwticket_wrlock(&(m->sl));
++    rwticket_wrlock(&(m->sl));
 +}
 +
 +static inline void bdg_wrunlock(safe_spinlock_t *m)
 +{
-+	rwticket_wrunlock(&(m->sl));
++    rwticket_wrunlock(&(m->sl));
 +}
 +
 +static inline void mtx_lock(safe_spinlock_t *m)
 +{
-+	m->flags = rwticket_wrlock_irqsave(&(m->sl));
++    m->flags = rwticket_wrlock_irqsave(&(m->sl));
 +}
 +
 +static inline void mtx_unlock(safe_spinlock_t *m)
 +{
-+	ulong flags = ACCESS_ONCE(m->flags);
-+	rwticket_wrunlock_irqrestore(&(m->sl), flags);
++    ulong flags = ACCESS_ONCE(m->flags);
++    rwticket_wrunlock_irqrestore(&(m->sl), flags);
 +}
 +
 +/*
@@ -498,19 +504,19 @@ index 0000000..bab5725
 +static __inline int
 +atomic_cmpset_int(volatile int *dst, int expect, int src)
 +{
-+	u_char res;
++    u_char res;
 +
-+	__asm __volatile(
-+	"       " MPLOCKED "            "
-+	"       cmpxchgl %3,%1 ;        "
-+	"       sete    %0 ;            "
-+	"# atomic_cmpset_int"
-+	: "=q" (res),                   /* 0 */
-+	  "+m" (*dst),                  /* 1 */
-+	  "+a" (expect)                 /* 2 */
-+	: "r" (src)                     /* 3 */
-+	: "memory", "cc");
-+	return (res);
++    __asm __volatile(
++    "       " MPLOCKED "            "
++    "       cmpxchgl %3,%1 ;        "
++    "       sete    %0 ;            "
++    "# atomic_cmpset_int"
++    : "=q" (res),                   /* 0 */
++      "+m" (*dst),                  /* 1 */
++      "+a" (expect)                 /* 2 */
++    : "r" (src)                     /* 3 */
++    : "memory", "cc");
++    return (res);
 +}
 +
 +#define __compiler_membar()     __asm __volatile(" " : : : "memory")
@@ -519,28 +525,28 @@ index 0000000..bab5725
 +atomic_store_rel_int(volatile int *p, int v)
 +{
 +
-+	__compiler_membar();
-+	*p = v;
++    __compiler_membar();
++    *p = v;
 +}
 +
 +#endif
 diff --git a/sys/dev/netmap/netmap.c b/sys/dev/netmap/netmap.c
-index 4f91d61..9621ce8 100644
+index 9d0add4..d5d2f75 100644
 --- a/sys/dev/netmap/netmap.c
 +++ b/sys/dev/netmap/netmap.c
-@@ -2326,7 +2326,6 @@ netmap_ioctl(struct netmap_priv_d *priv, u_long cmd, caddr_t data, struct thread
- 		}
+@@ -451,6 +451,7 @@ ports attached to the switch)
  
- 		break;
--
- #ifdef WITH_VALE
- 	case NIOCCONFIG:
- 		error = netmap_bdg_config(nmr);
+ #elif defined(linux)
+ 
++#define XENNET_LOCK
+ #include "bsd_glue.h"
+ 
+ #elif defined(__APPLE__)
 diff --git a/sys/dev/netmap/netmap_kern.h b/sys/dev/netmap/netmap_kern.h
-index 8a8b5cf..4015df5 100644
+index 50a0e85..e001b59 100644
 --- a/sys/dev/netmap/netmap_kern.h
 +++ b/sys/dev/netmap/netmap_kern.h
-@@ -156,7 +156,7 @@ struct hrtimer {
+@@ -157,7 +157,7 @@ struct hrtimer {
  /* See explanation in nm_os_generic_xmit_frame. */
  #define	GEN_TX_MBUF_IFP(m)	((struct ifnet *)skb_shinfo(m)->destructor_arg)
  
@@ -549,7 +555,7 @@ index 8a8b5cf..4015df5 100644
  
  #define NM_MTX_T	struct mutex	/* OS-specific sleepable lock */
  #define NM_MTX_INIT(m)	mutex_init(&(m))
-@@ -422,19 +422,21 @@ struct netmap_kring {
+@@ -443,12 +443,28 @@ struct netmap_kring {
  	 */
  	uint64_t	last_reclaim;
  
@@ -563,36 +569,36 @@ index 8a8b5cf..4015df5 100644
 +	uint32_t		*xen_nkr_leases;
 +	int (*xen_nm_sync)(struct netmap_kring *kring, int flags);
 +	int (*xen_nm_notify)(struct netmap_kring *kring, int flags);
++	int (*xen_vp_sync)(struct netmap_kring *kring, int flags);
  
 -	NM_SELINFO_T	si;		/* poll/select wait queue */
 -	NM_LOCK_T	q_lock;		/* protects kring and ring. */
 -	NM_ATOMIC_T	nr_busy;	/* prevent concurrent syscalls */
--
--	struct netmap_adapter *na;
-+	int (*xen_vp_sync)(struct netmap_kring *kring, int flags);
- 
--	/* The following fields are for VALE switch support */
--	struct nm_bdg_fwd *nkr_ft;
--	uint32_t	*nkr_leases;
--#define NR_NOSLOT	((uint32_t)~0)	/* used in nkr_*lease* */
--	uint32_t	nkr_hwlease;
--	uint32_t	nkr_lease_idx;
 +	uint32_t	ring_id;	/* kring identifier */
 +	enum txrx	tx;		/* kind of ring (tx or rx) */
  
- 	/* while nkr_stopped is set, no new [tr]xsync operations can
- 	 * be started on this kring.
-@@ -444,6 +446,31 @@ struct netmap_kring {
- 	 */
- 	volatile int nkr_stopped;
+-	struct netmap_adapter *na;
++	/* while nkr_stopped is set, no new [tr]xsync operations can
++	 * be started on this kring.
++	 * This is used by netmap_disable_all_rings()
++	 * to find a synchronization point where critical data
++	 * structures pointed to by the kring can be added or removed
++	 */
++	volatile int nkr_stopped;
  
-+	/* The following fields are for VALE switch support */
-+	struct nm_bdg_fwd *nkr_ft;
-+	uint32_t	*nkr_leases;
-+#define NR_NOSLOT	((uint32_t)~0)	/* used in nkr_*lease* */
-+	uint32_t	nkr_hwlease;
-+	uint32_t	nkr_lease_idx;
-+
+ 	/* The following fields are for VALE switch support */
+ 	struct nm_bdg_fwd *nkr_ft;
+@@ -457,13 +473,21 @@ struct netmap_kring {
+ 	uint32_t	nkr_hwlease;
+ 	uint32_t	nkr_lease_idx;
+ 
+-	/* while nkr_stopped is set, no new [tr]xsync operations can
+-	 * be started on this kring.
+-	 * This is used by netmap_disable_all_rings()
+-	 * to find a synchronization point where critical data
+-	 * structures pointed to by the kring can be added or removed
+-	 */
+-	volatile int nkr_stopped;
 +//#ifdef WITH_PIPES
 +	struct netmap_kring *pipe;	/* if this is a pipe ring,
 +					 * pointer to the other end
@@ -604,17 +610,14 @@ index 8a8b5cf..4015df5 100644
 +
 +	NM_ATOMIC_T	nr_busy;	/* prevent concurrent syscalls */
 +	NM_LOCK_T	q_lock;		/* protects kring and ring. */
-+//-------------------------------------------------------------------------- Shared
++	//-------------------Shared------------------
 +	NM_SELINFO_T	si;		/* poll/select wait queue */
-+
 +	char name[64];			/* diagnostic */
-+
 +	struct netmap_adapter *na;
-+
+ 
  	/* Support for adapters without native netmap support.
  	 * On tx rings we preallocate an array of tx buffers
- 	 * (same size as the netmap ring), on rx rings we
-@@ -457,10 +484,6 @@ struct netmap_kring {
+@@ -478,10 +502,6 @@ struct netmap_kring {
  
  	uint32_t	users;		/* existing bindings for this ring */
  
@@ -625,16 +628,13 @@ index 8a8b5cf..4015df5 100644
  	/* [tx]sync callback for this kring.
  	 * The default nm_kring_create callback (netmap_krings_create)
  	 * sets the nm_sync callback of each hardware tx(rx) kring to
-@@ -475,19 +498,13 @@ struct netmap_kring {
+@@ -496,16 +516,13 @@ struct netmap_kring {
  	int (*nm_sync)(struct netmap_kring *kring, int flags);
  	int (*nm_notify)(struct netmap_kring *kring, int flags);
  
 -#ifdef WITH_PIPES
 -	struct netmap_kring *pipe;	/* if this is a pipe ring,
 -					 * pointer to the other end
--					 */
--	struct netmap_ring *save_ring;	/* pointer to hidden rings
--       					 * (see netmap_pipe.c for details)
 -					 */
 -#endif /* WITH_PIPES */
 -
@@ -648,15 +648,15 @@ index 8a8b5cf..4015df5 100644
  #ifdef WITH_MONITOR
  	/* array of krings that are monitoring this kring */
  	struct netmap_kring **monitors;
-@@ -686,6 +703,7 @@ struct netmap_adapter {
- 	 * the generic netmap functions.
- 	 */
+@@ -713,6 +730,7 @@ struct netmap_adapter {
+ 	/* Back reference to the parent ifnet struct. Used for
+ 	 * hardware ports (emulated netmap included). */
  	struct ifnet *ifp; /* adapter is ifp->if_softc */
 +	struct ifnet *ifp2;
  
  	/*---- callbacks for this netmap adapter -----*/
  	/*
-@@ -725,6 +743,7 @@ struct netmap_adapter {
+@@ -752,6 +770,7 @@ struct netmap_adapter {
  	 *      kring->nm_notify.
  	 *      Return values are the same as for netmap_rx_irq().
  	 */
@@ -664,7 +664,7 @@ index 8a8b5cf..4015df5 100644
  	void (*nm_dtor)(struct netmap_adapter *);
  
  	int (*nm_register)(struct netmap_adapter *, int onoff);
-@@ -792,6 +811,8 @@ struct netmap_adapter {
+@@ -821,6 +840,8 @@ struct netmap_adapter {
  	/* Offset of ethernet header for each packet. */
  	u_int virt_hdr_len;
  
@@ -673,7 +673,7 @@ index 8a8b5cf..4015df5 100644
  	char name[64];
  };
  
-@@ -1398,7 +1419,7 @@ struct netmap_bdg_ops {
+@@ -1441,7 +1462,7 @@ struct netmap_bdg_ops {
  u_int netmap_bdg_learning(struct nm_bdg_fwd *ft, uint8_t *dst_ring,
  		struct netmap_vp_adapter *);
  
@@ -682,17 +682,26 @@ index 8a8b5cf..4015df5 100644
  #define	NM_BDG_MAXPORTS		254	/* up to 254 */
  #define	NM_BDG_BROADCAST	NM_BDG_MAXPORTS
  #define	NM_BDG_NOPORT		(NM_BDG_MAXPORTS+1)
-@@ -1717,6 +1738,8 @@ netmap_idx_k2n(struct netmap_kring *kr, int idx)
+@@ -1773,6 +1794,8 @@ netmap_idx_k2n(struct netmap_kring *kr, int idx)
  struct lut_entry {
  	void *vaddr;		/* virtual address. */
  	vm_paddr_t paddr;	/* physical address. */
 +	void *xvaddr;		/* Xen virtual address. */
 +	xen_pfn_t gfn;
  };
+ #else /* linux & _WIN32 */
+ /* dma-mapping in linux can assign a buffer a different address
+@@ -1783,6 +1806,8 @@ struct lut_entry {
+  */
+ struct lut_entry {
+ 	void *vaddr;		/* virtual address. */
++	void *xvaddr;		/* Xen virtual address. */
++	xen_pfn_t gfn;
+ };
  
- struct netmap_obj_pool;
-@@ -2065,4 +2088,139 @@ bool netmap_pt_guest_rxsync(struct ptnet_ring *ptring, struct netmap_kring *krin
- 			    int flags);
+ struct plut_entry {
+@@ -2173,4 +2198,142 @@ void ptnet_nm_krings_delete(struct netmap_adapter *na);
+ void ptnet_nm_dtor(struct netmap_adapter *na);
  #endif /* WITH_PTNETMAP_GUEST */
  
 +/*
@@ -722,6 +731,7 @@ index 8a8b5cf..4015df5 100644
 +#define NM_BDG_BATCH_MAX	(NM_BDG_BATCH + NM_MULTISEG)
 +/* NM_FT_NULL terminates a list of slots in the ft */
 +#define NM_FT_NULL		NM_BDG_BATCH_MAX
++#define NM_BDG_MFS_DEFAULT	1514
 +
 +/*
 + * For each output interface, nm_bdg_q is used to construct a list.
@@ -769,7 +779,8 @@ index 8a8b5cf..4015df5 100644
 +	 * XXX should be changed to an argument to be passed to
 +	 * the lookup function, and allocated on attach
 +	 */
-+	struct nm_hash_ent ht[NM_BDG_HASH];
++	struct nm_hash_ent *ht; // allocated on attach
++	//struct nm_hash_ent ht[NM_BDG_HASH];
 +
 +	/*
 +	 * The function to decide the destination port.
@@ -828,24 +839,66 @@ index 8a8b5cf..4015df5 100644
 +
 +extern struct netmap_xennet_ops *netmap_xen_ops;
 +
++static int netmap_vp_txsync(struct netmap_kring *kring, int flags);
 +int netmap_vp_rxsync(struct netmap_kring *kring, int flags);
 +
  #endif /* _NET_NETMAP_KERN_H_ */
 diff --git a/sys/dev/netmap/netmap_mem2.c b/sys/dev/netmap/netmap_mem2.c
-index 93096f8..6c4314c 100644
+index afb2c22..1c7ba41 100644
 --- a/sys/dev/netmap/netmap_mem2.c
 +++ b/sys/dev/netmap/netmap_mem2.c
-@@ -67,7 +67,8 @@ MALLOC_DEFINE(M_NETMAP, "netmap", "Network memory map");
+@@ -70,7 +70,7 @@ MALLOC_DEFINE(M_NETMAP, "netmap", "Network memory map");
  #ifdef _WIN32_USE_SMALL_GENERIC_DEVICES_MEMORY
  #define NETMAP_BUF_MAX_NUM  8*4096      /* if too big takes too much time to allocate */
  #else
 -#define NETMAP_BUF_MAX_NUM 20*4096*2	/* large machine */
-+//#define NETMAP_BUF_MAX_NUM 20*4096*2	/* large machine */
 +#define NETMAP_BUF_MAX_NUM 4096*8	/* large machine */
  #endif
  
  #define NETMAP_POOL_MAX_NAMSZ	32
-@@ -415,6 +416,20 @@ static struct netmap_obj_params netmap_min_priv_params[NETMAP_POOLS_NR] = {
+@@ -150,6 +150,41 @@ struct netmap_mem_ops {
+ 	void (*nmd_rings_delete)(struct netmap_adapter *);
+ };
+ 
++typedef uint16_t nm_memid_t;
++
++/*
++ * Shared info for netmap allocator
++ *
++ * Each allocator contains this structur as first netmap_if.
++ * In this way, we can share same details about allocator
++ * to the VM.
++ * Used in ptnetmap.
++ */
++struct netmap_mem_shared_info {
++#ifndef _WIN32
++        struct netmap_if up;	/* ends with a 0-sized array, which VSC does not like */
++#else /* !_WIN32 */
++	char up[sizeof(struct netmap_if)];
++#endif /* !_WIN32 */
++        uint64_t features;
++#define NMS_FEAT_BUF_POOL          0x0001
++#define NMS_FEAT_MEMSIZE           0x0002
++
++        uint32_t buf_pool_offset;
++        uint32_t buf_pool_objtotal;
++        uint32_t buf_pool_objsize;
++        uint32_t totalsize;
++};
++
++#define NMS_NAME        "nms_info"
++#define NMS_VERSION     1
++static const struct netmap_if nms_if_blueprint = {
++    .ni_name = NMS_NAME,
++    .ni_version = NMS_VERSION,
++    .ni_tx_rings = 0,
++    .ni_rx_rings = 0
++};
++
+ struct netmap_mem_d {
+ 	NMA_LOCK_T nm_mtx;  /* protect the allocator */
+ 	u_int nm_totalsize; /* shorthand */
+@@ -432,6 +467,21 @@ static struct netmap_obj_params netmap_min_priv_params[NETMAP_POOLS_NR] = {
  	},
  };
  
@@ -863,11 +916,12 @@ index 93096f8..6c4314c 100644
 +		.num  = 4098,
 +	},
 +};
++
  
  /*
   * nm_mem is the memory allocator used for all physical interfaces
-@@ -492,6 +507,37 @@ static const struct netmap_mem_d nm_blueprint = {
- 	.ops = &netmap_mem_private_ops
+@@ -490,6 +540,36 @@ struct netmap_mem_d nm_mem = {	/* Our memory allocator. */
+ 	.name = "1"
  };
  
 +extern struct netmap_mem_ops netmap_mem_private_shared_ops; /* forward */
@@ -900,38 +954,38 @@ index 93096f8..6c4314c 100644
 +
 +	.ops = &netmap_mem_private_shared_ops
 +};
-+
- /* memory allocator related sysctls */
  
- #define STRINGIFY(x) #x
-@@ -1085,7 +1131,7 @@ netmap_reset_obj_allocator(struct netmap_obj_pool *p)
- 		}
- 		bzero(p->lut, sizeof(struct lut_entry) * p->objtotal);
- #ifdef linux
--		vfree(p->lut);
-+		kfree(p->lut);
- #else
- 		free(p->lut, M_NETMAP);
- #endif
-@@ -1204,13 +1250,15 @@ nm_alloc_lut(u_int nobj)
+ /* blueprint for the private memory allocators */
+ /* XXX clang is not happy about using name as a print format */
+@@ -656,7 +736,7 @@ nm_alloc_lut(u_int nobj)
  	size_t n = sizeof(struct lut_entry) * nobj;
  	struct lut_entry *lut;
  #ifdef linux
 -	lut = vmalloc(n);
 +	lut = kzalloc(n, GFP_KERNEL);
  #else
- 	lut = malloc(n, M_NETMAP, M_NOWAIT | M_ZERO);
+ 	lut = nm_os_malloc(n);
  #endif
- 	return lut;
+@@ -668,7 +748,7 @@ nm_free_lut(struct lut_entry *lut, u_int objtotal)
+ {
+ 	bzero(lut, sizeof(struct lut_entry) * objtotal);
+ #ifdef linux
+-	vfree(lut);
++	kfree(lut);
+ #else
+ 	nm_os_free(lut);
+ #endif
+@@ -1300,6 +1380,8 @@ netmap_config_obj_allocator(struct netmap_obj_pool *p, u_int objtotal, u_int obj
+ 	return 0;
  }
  
-+
 +#include <xen/page.h>
++
  /* call with NMA_LOCK held */
  static int
  netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
-@@ -1242,6 +1290,15 @@ netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
- 	 * Allocate clusters, init pointers and bitmap
+@@ -1326,6 +1408,15 @@ netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
+ 	 * Allocate clusters, init pointers
  	 */
  
 +	if (xen_pv_domain()) {
@@ -946,10 +1000,10 @@ index 93096f8..6c4314c 100644
  	n = p->_clustsize;
  	for (i = 0; i < (int)p->objtotal;) {
  		int lim = i + p->_clustentries;
-@@ -1293,7 +1350,14 @@ netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
+@@ -1375,7 +1466,14 @@ netmap_finalize_obj_allocator(struct netmap_obj_pool *p)
  		for (; i < lim; i++, clust += p->_objsize) {
- 			p->bitmap[ (i>>5) ] |=  ( 1 << (i & 31) );
  			p->lut[i].vaddr = clust;
+ #if !defined(linux) && !defined(_WIN32)
 -			p->lut[i].paddr = vtophys(clust);
 +			if (xen_pv_domain()) {
 +				if (!xen_feature(XENFEAT_auto_translated_physmap))
@@ -959,16 +1013,176 @@ index 93096f8..6c4314c 100644
 +			} else {
 +				p->lut[i].paddr = vtophys(clust);
 +			}
+ #endif
  		}
  	}
- 	p->objfree = p->objtotal;
-@@ -1452,6 +1516,36 @@ error:
+@@ -1392,6 +1490,127 @@ clean:
+ 	return ENOMEM;
  }
  
++static void
++netmap_mem_reset_all(struct netmap_mem_d *nmd)
++{
++	int i;
++
++	if (netmap_verbose)
++		D("resetting %p", nmd);
++	for (i = 0; i < NETMAP_POOLS_NR; i++) {
++		netmap_reset_obj_allocator(&nmd->pools[i]);
++	}
++	nmd->flags  &= ~NETMAP_MEM_FINALIZED;
++}
++
++static int
++netmap_mem_init_shared_info(struct netmap_mem_d *nmd)
++{
++	struct netmap_mem_shared_info *nms_info;
++	ssize_t base;
++
++        /* Use the first slot in IF_POOL */
++	nms_info = netmap_if_malloc(nmd, sizeof(*nms_info));
++	if (nms_info == NULL) {
++	    return ENOMEM;
++	}
++
++	base = netmap_if_offset(nmd, nms_info);
++
++        memcpy(&nms_info->up, &nms_if_blueprint, sizeof(nms_if_blueprint));
++	nms_info->buf_pool_offset = nmd->pools[NETMAP_IF_POOL].memtotal + nmd->pools[NETMAP_RING_POOL].memtotal;
++	nms_info->buf_pool_objtotal = nmd->pools[NETMAP_BUF_POOL].objtotal;
++	nms_info->buf_pool_objsize = nmd->pools[NETMAP_BUF_POOL]._objsize;
++	nms_info->totalsize = nmd->nm_totalsize;
++	nms_info->features = NMS_FEAT_BUF_POOL | NMS_FEAT_MEMSIZE;
++
++	return 0;
++}
++
++static int
++netmap_mem_finalize_all(struct netmap_mem_d *nmd)
++{
++	int i;
++	if (nmd->flags & NETMAP_MEM_FINALIZED)
++		return 0;
++	nmd->lasterr = 0;
++	nmd->nm_totalsize = 0;
++	for (i = 0; i < NETMAP_POOLS_NR; i++) {
++		nmd->lasterr = netmap_finalize_obj_allocator(&nmd->pools[i]);
++		if (nmd->lasterr)
++			goto error;
++		nmd->nm_totalsize += nmd->pools[i].memtotal;
++	}
++	/* buffers 0 and 1 are reserved */
++	nmd->pools[NETMAP_BUF_POOL].objfree -= 2;
++	nmd->pools[NETMAP_BUF_POOL].bitmap[0] = ~3;
++	nmd->flags |= NETMAP_MEM_FINALIZED;
++
++	/* expose info to the ptnetmap guest */
++	nmd->lasterr = netmap_mem_init_shared_info(nmd);
++	if (nmd->lasterr)
++	        goto error;
++
++	if (netmap_verbose)
++		D("interfaces %d KB, rings %d KB, buffers %d MB",
++		    nmd->pools[NETMAP_IF_POOL].memtotal >> 10,
++		    nmd->pools[NETMAP_RING_POOL].memtotal >> 10,
++		    nmd->pools[NETMAP_BUF_POOL].memtotal >> 20);
++
++	if (netmap_verbose)
++		D("Free buffers: %d", nmd->pools[NETMAP_BUF_POOL].objfree);
++
++
++	return 0;
++error:
++	netmap_mem_reset_all(nmd);
++	return nmd->lasterr;
++}
++
++static void
++netmap_mem_private_delete(struct netmap_mem_d *nmd)
++{
++	if (nmd == NULL)
++		return;
++	if (netmap_verbose)
++		D("deleting %p", nmd);
++	if (nmd->active > 0)
++		D("bug: deleting mem allocator with active=%d!", nmd->active);
++	nm_mem_release_id(nmd);
++	if (netmap_verbose)
++		D("done deleting %p", nmd);
++	NMA_LOCK_DESTROY(nmd);
++	nm_os_free(nmd);
++}
++
++static int
++netmap_mem_private_config(struct netmap_mem_d *nmd)
++{
++	/* nothing to do, we are configured on creation
++ 	 * and configuration never changes thereafter
++ 	 */
++	return 0;
++}
++
++static int
++netmap_mem_private_finalize(struct netmap_mem_d *nmd)
++{
++	int err;
++	err = netmap_mem_finalize_all(nmd);
++	if (!err)
++		nmd->active++;
++	return err;
++
++}
++
++static void
++netmap_mem_private_deref(struct netmap_mem_d *nmd)
++{
++	if (--nmd->active <= 0)
++		netmap_mem_reset_all(nmd);
++}
++
++
+ /* call with lock held */
+ static int
+ netmap_mem_params_changed(struct netmap_obj_params* p)
+@@ -1408,19 +1627,6 @@ netmap_mem_params_changed(struct netmap_obj_params* p)
+ 	return rv;
+ }
  
+-static void
+-netmap_mem_reset_all(struct netmap_mem_d *nmd)
+-{
+-	int i;
+-
+-	if (netmap_verbose)
+-		D("resetting %p", nmd);
+-	for (i = 0; i < NETMAP_POOLS_NR; i++) {
+-		netmap_reset_obj_allocator(&nmd->pools[i]);
+-	}
+-	nmd->flags  &= ~NETMAP_MEM_FINALIZED;
+-}
+-
+ static int
+ netmap_mem_unmap(struct netmap_obj_pool *p, struct netmap_adapter *na)
+ {
+@@ -1519,40 +1725,123 @@ netmap_mem_map(struct netmap_obj_pool *p, struct netmap_adapter *na)
+ 	return error;
+ }
+ 
+-static int
+-netmap_mem_finalize_all(struct netmap_mem_d *nmd)
 +static void
 +netmap_mem_private_shared_delete(struct netmap_mem_d *nmd)
-+{
+ {
+-	int i;
+-	if (nmd->flags & NETMAP_MEM_FINALIZED)
+-		return 0;
+-	nmd->lasterr = 0;
+-	nmd->nm_totalsize = 0;
+-	for (i = 0; i < NETMAP_POOLS_NR; i++) {
+-		nmd->lasterr = netmap_finalize_obj_allocator(&nmd->pools[i]);
+-		if (nmd->lasterr)
+-			goto error;
+-		nmd->nm_totalsize += nmd->pools[i].memtotal;
 +	int last;
 +
 +	if (nmd == NULL)
@@ -984,25 +1198,29 @@ index 93096f8..6c4314c 100644
 +	if (!last) {
 +		D("There are still users %u", last);
 +		return;
-+	}
+ 	}
+-	nmd->lasterr = netmap_mem_init_bitmaps(nmd);
+-	if (nmd->lasterr)
+-		goto error;
 +	D("Delete nm_mem");
-+
+ 
+-	nmd->flags |= NETMAP_MEM_FINALIZED;
 +	if (nmd->active > 0)
 +		D("bug: deleting mem allocator with active=%d!", nmd->active);
-+
+ 
 +	nm_mem_release_id(nmd);
-+	if (netmap_verbose)
+ 	if (netmap_verbose)
+-		D("interfaces %d KB, rings %d KB, buffers %d MB",
+-		    nmd->pools[NETMAP_IF_POOL].memtotal >> 10,
+-		    nmd->pools[NETMAP_RING_POOL].memtotal >> 10,
+-		    nmd->pools[NETMAP_BUF_POOL].memtotal >> 20);
 +		D("done deleting %p", nmd);
 +	NMA_LOCK_DESTROY(nmd);
-+	free(nmd, M_DEVBUF);
++	nm_os_free(nmd);
 +}
  
- static void
- netmap_mem_private_delete(struct netmap_mem_d *nmd)
-@@ -1497,6 +1591,95 @@ netmap_mem_private_deref(struct netmap_mem_d *nmd)
- }
- 
- 
+-	if (netmap_verbose)
+-		D("Free buffers: %d", nmd->pools[NETMAP_BUF_POOL].objfree);
 +struct netmap_mem_d *
 +netmap_mem_private_shared_new(const char *name, u_int txr, u_int txd,
 +	u_int rxr, u_int rxd, u_int extra_bufs, u_int npipes, int *perr)
@@ -1011,14 +1229,14 @@ index 93096f8..6c4314c 100644
 +	struct netmap_obj_params p[NETMAP_POOLS_NR];
 +	int i, err;
 +	u_int v, maxd;
-+
-+	d = malloc(sizeof(struct netmap_mem_d),
-+		   M_DEVBUF, M_NOWAIT | M_ZERO);
+ 
++	d = nm_os_malloc(sizeof(struct netmap_mem_d));
 +	if (d == NULL) {
 +		err = ENOMEM;
 +		goto error;
 +	}
-+
+ 
+-	return 0;
 +	*d = nm_blueprint_shared;
 +
 +	err = nm_mem_assign_id(d);
@@ -1085,20 +1303,20 @@ index 93096f8..6c4314c 100644
 +	NMA_LOCK_INIT(d);
 +
 +	return d;
-+error:
+ error:
+-	netmap_mem_reset_all(nmd);
+-	return nmd->lasterr;
 +	netmap_mem_private_shared_delete(d);
 +	if (perr)
 +		*perr = err;
 +	return NULL;
-+}
-+
+ }
+ 
  /*
-  * allocator for private memory
-  */
-@@ -1909,6 +2092,20 @@ struct netmap_mem_ops netmap_mem_private_ops = {
- 	.nmd_rings_create = netmap_mem2_rings_create,
+@@ -2013,6 +2302,21 @@ struct netmap_mem_ops netmap_mem_global_ops = {
  	.nmd_rings_delete = netmap_mem2_rings_delete
  };
+ 
 +struct netmap_mem_ops netmap_mem_private_shared_ops = {
 +	.nmd_get_lut = netmap_mem2_get_lut,
 +	.nmd_get_info = netmap_mem2_get_info,
@@ -1113,28 +1331,30 @@ index 93096f8..6c4314c 100644
 +	.nmd_rings_create = netmap_mem2_rings_create,
 +	.nmd_rings_delete = netmap_mem2_rings_delete
 +};
- 
- #ifdef WITH_PTNETMAP_GUEST
- struct mem_pt_if {
++
+ int
+ netmap_mem_pools_info_get(struct nmreq *nmr, struct netmap_mem_d *nmd)
+ {
 diff --git a/sys/dev/netmap/netmap_mem2.h b/sys/dev/netmap/netmap_mem2.h
-index 5e585e2..7c57ec0 100644
+index 9723385..d3cb3c0 100644
 --- a/sys/dev/netmap/netmap_mem2.h
 +++ b/sys/dev/netmap/netmap_mem2.h
-@@ -136,6 +136,9 @@ ssize_t    netmap_mem_if_offset(struct netmap_mem_d *, const void *vaddr);
- struct netmap_mem_d* netmap_mem_private_new(const char *name,
- 	u_int txr, u_int txd, u_int rxr, u_int rxd, u_int extra_bufs, u_int npipes,
- 	int* error);
+@@ -140,6 +140,10 @@ int	   netmap_mem_get_info(struct netmap_mem_d *, uint64_t *size, u_int *memflag
+ ssize_t    netmap_mem_if_offset(struct netmap_mem_d *, const void *vaddr);
+ struct netmap_mem_d* netmap_mem_private_new( u_int txr, u_int txd, u_int rxr, u_int rxd,
+ 		u_int extra_bufs, u_int npipes, int* error);
 +struct netmap_mem_d* netmap_mem_private_shared_new(const char *name,
-+	u_int txr, u_int txd, u_int rxr, u_int rxd, u_int extra_bufs, u_int npipes,
-+	int* error);
++		u_int txr, u_int txd, u_int rxr, u_int rxd, u_int extra_bufs, u_int npipes,
++		int* error);
++static void netmap_mem_private_shared_delete(struct netmap_mem_d *nmd);
  void	   netmap_mem_delete(struct netmap_mem_d *);
  
- //#define NM_DEBUG_MEM_PUTGET 1
+ #define netmap_mem_get(d) __netmap_mem_get(d, __FUNCTION__, __LINE__)
 diff --git a/sys/dev/netmap/netmap_vale.c b/sys/dev/netmap/netmap_vale.c
-index 9e290f1..7ed9466 100644
+index 41ebcee..e6086ab 100644
 --- a/sys/dev/netmap/netmap_vale.c
 +++ b/sys/dev/netmap/netmap_vale.c
-@@ -94,6 +94,7 @@ __FBSDID("$FreeBSD: head/sys/dev/netmap/netmap.c 257176 2013-10-26 17:58:36Z gle
+@@ -95,6 +95,7 @@ __FBSDID("$FreeBSD: head/sys/dev/netmap/netmap.c 257176 2013-10-26 17:58:36Z gle
  
  #elif defined(linux)
  
@@ -1142,47 +1362,10 @@ index 9e290f1..7ed9466 100644
  #include "bsd_glue.h"
  
  #elif defined(__APPLE__)
-@@ -121,35 +122,6 @@ __FBSDID("$FreeBSD: head/sys/dev/netmap/netmap.c 257176 2013-10-26 17:58:36Z gle
- #ifdef WITH_VALE
- 
- /*
-- * system parameters (most of them in netmap_kern.h)
-- * NM_NAME	prefix for switch port names, default "vale"
-- * NM_BDG_MAXPORTS	number of ports
-- * NM_BRIDGES	max number of switches in the system.
-- *	XXX should become a sysctl or tunable
-- *
-- * Switch ports are named valeX:Y where X is the switch name and Y
-- * is the port. If Y matches a physical interface name, the port is
-- * connected to a physical device.
-- *
-- * Unlike physical interfaces, switch ports use their own memory region
-- * for rings and buffers.
-- * The virtual interfaces use per-queue lock instead of core lock.
-- * In the tx loop, we aggregate traffic in batches to make all operations
-- * faster. The batch size is bridge_batch.
-- */
--#define NM_BDG_MAXRINGS		16	/* XXX unclear how many. */
--#define NM_BDG_MAXSLOTS		4096	/* XXX same as above */
--#define NM_BRIDGE_RINGSIZE	1024	/* in the device */
--#define NM_BDG_HASH		1024	/* forwarding table entries */
--#define NM_BDG_BATCH		1024	/* entries in the forwarding buffer */
--#define NM_MULTISEG		64	/* max size of a chain of bufs */
--/* actual size of the tables */
--#define NM_BDG_BATCH_MAX	(NM_BDG_BATCH + NM_MULTISEG)
--/* NM_FT_NULL terminates a list of slots in the ft */
--#define NM_FT_NULL		NM_BDG_BATCH_MAX
--
--
--/*
-  * bridge_batch is set via sysctl to the max batch size to be
-  * used in the bridge. The actual value may be larger as the
-  * last packet in the block may overflow the size.
-@@ -163,73 +135,8 @@ SYSEND;
- static int netmap_vp_create(struct nmreq *, struct ifnet *, struct netmap_vp_adapter **);
+@@ -169,73 +170,6 @@ static int netmap_vp_create(struct nmreq *, struct ifnet *,
  static int netmap_vp_reg(struct netmap_adapter *na, int onoff);
  static int netmap_bwrap_reg(struct netmap_adapter *, int onoff);
--
+ 
 -/*
 - * For each output interface, nm_bdg_q is used to construct a list.
 - * bq_len is the number of output buffers (we can have coalescing
@@ -1241,20 +1424,19 @@ index 9e290f1..7ed9466 100644
 -
 -	/* the forwarding table, MAC+ports.
 -	 * XXX should be changed to an argument to be passed to
--	 * the lookup function, and allocated on attach
+-	 * the lookup function
 -	 */
--	struct nm_hash_ent ht[NM_BDG_HASH];
+-	struct nm_hash_ent *ht; // allocated on attach
 -
 -#ifdef CONFIG_NET_NS
 -	struct net *ns;
 -#endif /* CONFIG_NET_NS */
 -};
-+static int netmap_vp_txsync(struct netmap_kring *kring, int flags);
-+int netmap_vp_rxsync(struct netmap_kring *kring, int flags);
- 
+-
  const char*
  netmap_bdg_name(struct netmap_vp_adapter *vp)
-@@ -460,8 +367,10 @@ netmap_bdg_detach_common(struct nm_bridge *b, int hw, int sw)
+ {
+@@ -497,8 +431,10 @@ netmap_bdg_detach_common(struct nm_bridge *b, int hw, int sw)
  	if (b->bdg_ops.dtor)
  		b->bdg_ops.dtor(b->bdg_ports[s_hw]);
  	b->bdg_ports[s_hw] = NULL;
@@ -1265,7 +1447,7 @@ index 9e290f1..7ed9466 100644
  	}
  	memcpy(b->bdg_port_index, tmp, sizeof(tmp));
  	b->bdg_active_ports = lim;
-@@ -1351,10 +1260,10 @@ nm_bdg_preflush(struct netmap_kring *kring, u_int end)
+@@ -1487,10 +1423,10 @@ nm_bdg_preflush(struct netmap_kring *kring, u_int end)
  	 * attached to a user process) or with a trylock otherwise (NICs).
  	 */
  	ND("wait rlock for %d packets", ((j > end ? lim+1 : 0) + end) - j);
@@ -1273,13 +1455,13 @@ index 9e290f1..7ed9466 100644
 +	//if (na->up.na_flags & NAF_BDG_MAYSLEEP)
  		BDG_RLOCK(b);
 -	else if (!BDG_RTRYLOCK(b))
--		return 0;
+-		return j;
 +	//else if (!BDG_RTRYLOCK(b))
-+	//	return 0;
++	//	return j;
  	ND(5, "rlock acquired for %d packets", ((j > end ? lim+1 : 0) + end) - j);
  	ft = kring->nkr_ft;
  
-@@ -1789,7 +1698,8 @@ nm_bdg_flush(struct nm_bdg_fwd *ft, u_int n, struct netmap_vp_adapter *na,
+@@ -1934,7 +1870,8 @@ nm_bdg_flush(struct nm_bdg_fwd *ft, u_int n, struct netmap_vp_adapter *na,
  
  		ND(5, "pass 2 dst %d is %x %s",
  			i, d_i, is_vp ? "virtual" : "nic/host");
@@ -1289,7 +1471,7 @@ index 9e290f1..7ed9466 100644
  		nrings = dst_na->up.num_rx_rings;
  		if (dst_nr >= nrings)
  			dst_nr = dst_nr % nrings;
-@@ -2054,7 +1964,7 @@ done:
+@@ -2202,7 +2139,7 @@ done:
   * but we must acquire the queue's lock to protect against
   * writers on the same queue.
   */
@@ -1298,32 +1480,31 @@ index 9e290f1..7ed9466 100644
  netmap_vp_rxsync(struct netmap_kring *kring, int flags)
  {
  	int n;
-@@ -2144,10 +2054,16 @@ netmap_vp_create(struct nmreq *nmr, struct ifnet *ifp, struct netmap_vp_adapter
- 	na->nm_krings_create = netmap_vp_krings_create;
+@@ -2298,12 +2235,16 @@ netmap_vp_create(struct nmreq *nmr, struct ifnet *ifp,
  	na->nm_krings_delete = netmap_vp_krings_delete;
  	na->nm_dtor = netmap_vp_dtor;
--	na->nm_mem = netmap_mem_private_new(na->name,
--			na->num_tx_rings, na->num_tx_desc,
--			na->num_rx_rings, na->num_rx_desc,
--			nmr->nr_arg3, npipes, &error);
+ 	D("nr_arg2 %d", nmr->nr_arg2);
+-	na->nm_mem = nmd ?
+-		netmap_mem_get(nmd):
+-		netmap_mem_private_new(
 +	if (nmr->nm_mem) {
 +		D("We share the same nm_mem %p", nmr->nm_mem);
 +		na->nm_mem = (struct netmap_mem_d *) nmr->nm_mem;
 +		netmap_mem_get(na->nm_mem);
 +	} else {
-+		na->nm_mem = netmap_mem_private_new(na->name,
-+				na->num_tx_rings, na->num_tx_desc,
-+				na->num_rx_rings, na->num_rx_desc,
-+				nmr->nr_arg3, npipes, &error);
++		na->nm_mem = netmap_mem_private_new(
+ 			na->num_tx_rings, na->num_tx_desc,
+ 			na->num_rx_rings, na->num_rx_desc,
+ 			nmr->nr_arg3, npipes, &error);
 +	}
  	if (na->nm_mem == NULL)
  		goto err;
  	na->nm_bdg_attach = netmap_vp_bdg_attach;
 diff --git a/sys/net/netmap.h b/sys/net/netmap.h
-index a9a8756..4ef16c3 100644
+index 78c0026..05325da 100644
 --- a/sys/net/netmap.h
 +++ b/sys/net/netmap.h
-@@ -362,7 +362,7 @@ struct netmap_if {
+@@ -363,7 +363,7 @@ struct netmap_if {
  	 * The area is filled up by the kernel on NIOCREGIF,
  	 * and then only read by userspace code.
  	 */
@@ -1332,7 +1513,7 @@ index a9a8756..4ef16c3 100644
  };
  
  
-@@ -533,6 +533,7 @@ struct nmreq {
+@@ -536,6 +536,7 @@ struct nmreq {
  	uint32_t	nr_flags;
  	/* various modes, extends nr_ringid */
  	uint32_t	spare2[1];
@@ -1341,5 +1522,5 @@ index a9a8756..4ef16c3 100644
  
  #define NR_REG_MASK		0xf /* values for nr_flags */
 -- 
-2.1.4
+2.7.4
 
